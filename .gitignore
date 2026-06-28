@@ -1,0 +1,11 @@
+build*/
+*.o
+*.a
+data/*.bin
+data/*.gz
+__pycache__/
+*.pyc
+lobpy*.so
+lobpy*.pyd
+compile_commands.json
+/.claude
