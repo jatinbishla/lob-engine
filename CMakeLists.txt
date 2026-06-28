@@ -20,3 +20,30 @@ target_include_directories(lob PUBLIC include)
 # Demo executable
 add_executable(demo src/main.cpp)
 target_link_libraries(demo PRIVATE lob)
+
+# ---- Tests (Catch2 via FetchContent) ----
+include(FetchContent)
+FetchContent_Declare(
+  Catch2
+  GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+  GIT_TAG v3.4.0
+)
+FetchContent_MakeAvailable(Catch2)
+
+enable_testing()
+add_executable(tests tests/test_matching.cpp)
+target_link_libraries(tests PRIVATE lob Catch2::Catch2WithMain)
+add_test(NAME matching COMMAND tests)
+
+# On Windows/MinGW, ctest spawns the test without the compiler's runtime DLL
+# directory on PATH (libstdc++, libgcc, libwinpthread). Prepend it so ctest can
+# launch the binary. No-op on Linux CI, where the runtime is on the system path.
+if(WIN32)
+  get_filename_component(_lob_cxx_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  set_tests_properties(matching PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_lob_cxx_dir}")
+endif()
+
+# ---- Scenarios ----
+add_executable(scenarios scenarios/validate_scenarios.cpp)
+target_link_libraries(scenarios PRIVATE lob)
