@@ -1,5 +1,6 @@
 #pragma once
 #include "lob/types.hpp"
+#include "lob/risk.hpp"
 #include <map>
 #include <list>
 #include <unordered_map>
@@ -16,7 +17,7 @@ class OrderBook {
 public:
     struct SubmitResult {
         std::vector<Trade> trades;
-        // RiskResult added in M4
+        RiskResult         risk = RiskResult::OK;
     };
 
     SubmitResult submit(Order order);
@@ -38,7 +39,8 @@ private:
     };
     std::unordered_map<OrderId, Location> index_;
 
-    Sequence seq_ = 0;
+    RiskGuard risk_;
+    Sequence  seq_ = 0;
 
     // Template: works for both bid-side and ask-side maps
     // (different comparators = different types)
