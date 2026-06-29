@@ -1,6 +1,7 @@
 #pragma once
 #include "lob/types.hpp"
 #include "lob/risk.hpp"
+#include "lob/pool.hpp"
 #include <map>
 #include <list>
 #include <unordered_map>
@@ -8,9 +9,13 @@
 
 namespace lob {
 
+// Order queue at a price level. Backed by the arena pool so resting an order
+// costs no system allocation on the hot path. (M6 optimization — Opt 1.)
+using OrderList = std::list<Order, PoolAllocator<Order>>;
+
 struct Level {
-    std::list<Order> orders;  // front = oldest = highest priority
-    Quantity total = 0;       // cached depth — avoid re-summing
+    OrderList orders;    // front = oldest = highest priority
+    Quantity  total = 0; // cached depth — avoid re-summing
 };
 
 class OrderBook {
@@ -33,9 +38,9 @@ private:
     std::map<Price, Level>                      asks_;
 
     struct Location {
-        Side                       side;
-        Price                      price;
-        std::list<Order>::iterator it;
+        Side                 side;
+        Price                price;
+        OrderList::iterator  it;
     };
     std::unordered_map<OrderId, Location> index_;
 

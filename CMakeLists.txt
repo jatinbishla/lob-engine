@@ -10,7 +10,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 
 # Core library (built from src/order_book.cpp)
@@ -47,3 +47,17 @@ endif()
 # ---- Scenarios ----
 add_executable(scenarios scenarios/validate_scenarios.cpp)
 target_link_libraries(scenarios PRIVATE lob)
+
+# ---- Google Benchmark ----
+FetchContent_Declare(
+  benchmark
+  GIT_REPOSITORY https://github.com/google/benchmark.git
+  GIT_TAG v1.8.3
+)
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)   # GB 1.8.3 -Werror trips on GCC 15
+set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(benchmark)
+
+add_executable(bench bench/bench_book.cpp)
+target_link_libraries(bench PRIVATE lob benchmark::benchmark)
