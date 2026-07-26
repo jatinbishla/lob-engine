@@ -16,6 +16,9 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 # Core library (matching engine + ITCH feed parser)
 add_library(lob STATIC src/order_book.cpp src/itch_parser.cpp)
 target_include_directories(lob PUBLIC include)
+# Position-independent so the static lib can be linked into the shared Python
+# module (lobpy) on Linux; harmless for the executables that link it statically.
+set_target_properties(lob PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Demo executable
 add_executable(demo src/main.cpp)
