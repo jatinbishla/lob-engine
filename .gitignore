@@ -3,6 +3,7 @@ build*/
 *.a
 data/*.bin
 data/*.gz
+data/latency_samples.csv
 __pycache__/
 *.pyc
 lobpy*.so

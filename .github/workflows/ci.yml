@@ -72,5 +72,9 @@ jobs:
         run: cmake --build build --target lobpy -j"$(nproc)"
       - name: Import + smoke test
         run: PYTHONPATH="$PWD/build" python python/smoke_test.py
+      - name: Benchmark (generate latency samples)
+        run: |
+          cmake --build build --target bench -j"$(nproc)"
+          ./build/bench   # writes data/latency_samples.csv (run from repo root)
       - name: Generate README charts
         run: PYTHONPATH="$PWD/build" python python/make_charts.py

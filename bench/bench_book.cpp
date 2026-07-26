@@ -5,6 +5,7 @@
 #include <numeric>
 #include <cmath>
 #include <iostream>
+#include <fstream>
 #include "lob/order_book.hpp"
 
 using namespace lob;
@@ -72,6 +73,19 @@ void run_percentile_benchmark() {
     std::cout << "  p99.9:  " << percentile(99.9) << " ns\n";
     std::cout << "Classification: price-time priority matching, object pool (arena), std::map levels\n";
     std::cout << "Boundary: order submitted -> trades vector returned (no I/O, no logging)\n";
+
+    // Dump raw per-op samples so the histogram is plotted from real data
+    // (see python/make_charts.py), not a modeled distribution.
+    const char* csv_path = "data/latency_samples.csv";
+    std::ofstream csv(csv_path);
+    if (csv) {
+        csv << "latency_ns\n";
+        for (int64_t ns : latencies) csv << ns << '\n';
+        std::cout << "Wrote " << latencies.size() << " samples to " << csv_path << "\n";
+    } else {
+        std::cout << "WARNING: could not open " << csv_path
+                  << " (run from the repo root so data/ exists)\n";
+    }
 }
 
 int main(int argc, char** argv) {

@@ -81,22 +81,15 @@ def depth_chart():
 # 2. Latency histogram — distribution with percentile markers
 # ----------------------------------------------------------------------------
 def latency_hist():
-    # Prefer real measured data if the bench exported it; otherwise model a
-    # distribution reproducing the documented post-pool percentiles
-    # (BENCHMARKS.md: p50 ~100ns, p99 ~600ns, p99.9 ~6us).
-    csv = os.path.join(os.path.dirname(__file__), os.pardir, "data", "latencies.csv")
-    if os.path.exists(csv):
-        lat = np.loadtxt(csv)
-        source = "measured (data/latencies.csv)"
-    else:
-        rng = np.random.default_rng(7)
-        n = 1_000_000
-        body = rng.lognormal(mean=np.log(100), sigma=0.45, size=n)   # bulk near ~100ns
-        tail = rng.lognormal(mean=np.log(1500), sigma=0.9, size=n)   # occasional stalls
-        mask = rng.random(n) < 0.01                                  # ~1% hit the tail
-        lat = np.where(mask, tail, body)
-        source = "modeled to BENCHMARKS.md percentiles"
+    # Plotted from real per-op samples emitted by ./build/bench — no modeling.
+    csv = os.path.join(os.path.dirname(__file__), os.pardir, "data", "latency_samples.csv")
+    if not os.path.exists(csv):
+        raise SystemExit(
+            "data/latency_samples.csv not found — run ./build/bench first "
+            "(from the repo root) to generate the per-op latency samples.")
+    lat = np.loadtxt(csv, skiprows=1)  # skip the 'latency_ns' header
 
+    # Percentiles computed directly from the loaded samples.
     p50, p99, p999 = np.percentile(lat, [50, 99, 99.9])
     fig, ax = plt.subplots(figsize=(7.2, 4.0))
     bins = np.logspace(np.log10(max(lat.min(), 1)), np.log10(lat.max()), 60)
@@ -109,7 +102,7 @@ def latency_hist():
                 rotation=90, va="top", ha="right", color=col, fontsize=9)
 
     ax.set_title("Submit-path latency distribution", color=INK, fontsize=13, loc="left")
-    ax.set_xlabel(f"Latency per order (ns, log scale) — {source}")
+    ax.set_xlabel("Latency per order (ns, log scale) — 1,000,000 events")
     ax.set_ylabel("Count")
     fig.tight_layout()
     out = os.path.join(IMG, "latency_hist.png")
