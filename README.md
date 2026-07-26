@@ -7,7 +7,7 @@ allocation on the hot path, microstructure signals, and Python bindings.
 Built for correctness first (price-time priority, sanitizer-clean, CI-gated) and
 speed second (sub-microsecond median submit latency).
 
-[![CI](https://github.com/OWNER/lob-engine/actions/workflows/ci.yml/badge.svg)](../../actions)
+[![CI](https://github.com/jatinbishla/lob-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/jatinbishla/lob-engine/actions/workflows/ci.yml)
 
 ---
 
