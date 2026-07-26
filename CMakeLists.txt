@@ -48,6 +48,11 @@ endif()
 add_executable(scenarios scenarios/validate_scenarios.cpp)
 target_link_libraries(scenarios PRIVATE lob)
 
+# ---- Pipeline demo (M7: concurrent ingest + match over lock-free SPSC ring) ----
+find_package(Threads REQUIRED)
+add_executable(pipeline apps/pipeline.cpp)
+target_link_libraries(pipeline PRIVATE lob Threads::Threads)
+
 # ---- Google Benchmark ----
 FetchContent_Declare(
   benchmark
