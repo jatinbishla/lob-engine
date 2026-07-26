@@ -1,0 +1,2 @@
+# Drop real NASDAQ TotalView-ITCH 5.0 files here (gitignored).
+# Replay:  ./build/itch_replay data/your_feed.itch

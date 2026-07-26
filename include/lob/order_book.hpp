@@ -28,6 +28,14 @@ public:
     SubmitResult submit(Order order);
     bool cancel(OrderId id);
 
+    // ---- Feed-replay API (M8) ----
+    // An ITCH feed is already the *result* of matching upstream, so replayed
+    // orders never cross — they rest, and are later reduced or replaced by
+    // reference number. These bypass both the matcher and the risk guard.
+    void rest(Order order);                  // place a resting order directly
+    bool reduce(OrderId id, Quantity qty);   // executed/cancelled shares; erase at 0
+    bool replace(OrderId old_id, OrderId new_id, Price new_price, Quantity new_qty);
+
     bool best_bid(Price& out) const;
     bool best_ask(Price& out) const;
     Quantity depth_at(Side side, Price price) const;

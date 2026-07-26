@@ -116,6 +116,55 @@ bool OrderBook::cancel(OrderId id) {
     return true;
 }
 
+// ---- Feed-replay API (M8) ----
+
+void OrderBook::rest(Order order) {
+    auto& level = (order.side == Side::Buy) ? bids_[order.price]
+                                            : asks_[order.price];
+    level.orders.push_back(order);
+    level.total += order.quantity;
+    auto it = std::prev(level.orders.end());
+    index_[order.id] = Location{ order.side, order.price, it };
+}
+
+bool OrderBook::reduce(OrderId id, Quantity qty) {
+    auto found = index_.find(id);
+    if (found == index_.end()) return false;
+
+    Location& loc      = found->second;
+    Quantity& resting  = loc.it->quantity;
+    Quantity  dec      = std::min(qty, resting);
+    resting           -= dec;
+
+    if (loc.side == Side::Buy) {
+        auto& level = bids_[loc.price];
+        level.total -= dec;
+        if (resting == 0) {
+            level.orders.erase(loc.it);
+            if (level.orders.empty()) bids_.erase(loc.price);
+        }
+    } else {
+        auto& level = asks_[loc.price];
+        level.total -= dec;
+        if (resting == 0) {
+            level.orders.erase(loc.it);
+            if (level.orders.empty()) asks_.erase(loc.price);
+        }
+    }
+    if (resting == 0) index_.erase(found);
+    return true;
+}
+
+bool OrderBook::replace(OrderId old_id, OrderId new_id,
+                        Price new_price, Quantity new_qty) {
+    auto found = index_.find(old_id);
+    if (found == index_.end()) return false;
+    Side side = found->second.side;    // replace keeps the original side
+    cancel(old_id);                    // full removal (invalidates `found`)
+    rest({ new_id, side, OrderType::Limit, new_price, new_qty });
+    return true;
+}
+
 bool OrderBook::best_bid(Price& out) const {
     if (bids_.empty()) return false;
     out = bids_.begin()->first;

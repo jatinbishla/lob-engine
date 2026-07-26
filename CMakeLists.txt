@@ -13,8 +13,8 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 
-# Core library (built from src/order_book.cpp)
-add_library(lob STATIC src/order_book.cpp)
+# Core library (matching engine + ITCH feed parser)
+add_library(lob STATIC src/order_book.cpp src/itch_parser.cpp)
 target_include_directories(lob PUBLIC include)
 
 # Demo executable
@@ -52,6 +52,10 @@ target_link_libraries(scenarios PRIVATE lob)
 find_package(Threads REQUIRED)
 add_executable(pipeline apps/pipeline.cpp)
 target_link_libraries(pipeline PRIVATE lob Threads::Threads)
+
+# ---- ITCH replay (M8: NASDAQ ITCH 5.0 parse -> book -> microstructure signals) ----
+add_executable(itch_replay apps/itch_replay.cpp)
+target_link_libraries(itch_replay PRIVATE lob)
 
 # ---- Google Benchmark ----
 FetchContent_Declare(
