@@ -1,0 +1,76 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    name: build + tests (Release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Release, no Python)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_PYTHON=OFF
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Scenario validation
+        run: ./build/scenarios
+      - name: SPSC pipeline (determinism check)
+        run: ./build/pipeline
+      - name: ITCH replay (reconstruction + signals check)
+        run: ./build/itch_replay
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Debug, ASan + UBSan)
+        run: |
+          cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DLOB_BUILD_PYTHON=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+      - name: Build
+        run: cmake --build build-san -j"$(nproc)"
+      - name: Tests under sanitizers
+        run: ctest --test-dir build-san --output-on-failure
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      - name: Scenarios under sanitizers
+        run: ./build-san/scenarios
+      - name: ITCH replay under sanitizers
+        run: ./build-san/itch_replay
+
+  thread-sanitizer:
+    name: TSan (SPSC pipeline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Debug, TSan)
+        run: |
+          cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DLOB_BUILD_PYTHON=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -g"
+      - name: Build pipeline
+        run: cmake --build build-tsan --target pipeline -j"$(nproc)"
+      - name: Run pipeline under TSan
+        run: ./build-tsan/pipeline
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+
+  python-bindings:
+    name: Python bindings (lobpy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps
+        run: python -m pip install --upgrade pip pybind11 numpy matplotlib
+      - name: Configure (with Python bindings)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_PYTHON=ON
+      - name: Build lobpy
+        run: cmake --build build --target lobpy -j"$(nproc)"
+      - name: Import + smoke test
+        run: PYTHONPATH="$PWD/build" python python/smoke_test.py
+      - name: Generate README charts
+        run: PYTHONPATH="$PWD/build" python python/make_charts.py
