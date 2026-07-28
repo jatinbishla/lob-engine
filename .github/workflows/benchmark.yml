@@ -4,6 +4,10 @@ name: Benchmark
 on:
   workflow_dispatch:
 
+# The commit-back step needs push access; artifact upload does not.
+permissions:
+  contents: write
+
 jobs:
   benchmark:
     name: latency + throughput (Linux x86)
@@ -39,6 +43,10 @@ jobs:
       - name: Regenerate charts from the (pooled) samples
         run: python3 python/make_charts.py
 
+      - name: Write results into README.md + BENCHMARKS.md
+        run: python3 python/update_readme.py bench_output_pool.txt bench_output_nopool.txt
+
+      # Upload BEFORE committing so results are inspectable even if the commit is a no-op.
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
@@ -48,4 +56,17 @@ jobs:
             bench_output_pool.txt
             bench_output_nopool.txt
             data/latency_samples.csv
+            README.md
             BENCHMARKS.md
+
+      - name: Commit results back to the repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md BENCHMARKS.md images/*.png
+          if git diff --cached --quiet; then
+            echo "No result changes to commit."
+          else
+            git commit -m "perf: update benchmark results and charts [skip ci]"
+            git push
+          fi
