@@ -1,5 +1,6 @@
 #include <benchmark/benchmark.h>
 #include <chrono>
+#include <thread>
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -10,13 +11,62 @@
 #include <fstream>
 #include "lob/order_book.hpp"
 
+// Per-op timing backend: the x86 timestamp counter (rdtsc) where available,
+// std::chrono::steady_clock elsewhere. clock_gettime costs ~20 ns/call even
+// through the vDSO — a large fraction of the operation we're timing — so on x86
+// we read the TSC directly with lfence serialization and subtract the measured
+// overhead. (See BENCHMARKS.md.)
+#if defined(__x86_64__) || defined(__i386__)
+  #define LOB_USE_RDTSC 1
+  #include <x86intrin.h>
+#else
+  #define LOB_USE_RDTSC 0
+#endif
+
 using namespace lob;
 
-// Measure steady_clock's real tick granularity: the smallest non-zero gap
-// between two consecutive reads. Sampled ~1000 times, minimum taken. If this
-// exceeds the operation we intend to time, the benchmark is meaningless — the
-// clock quantizes every sample to 0 or one tick, so p50 and p95 collapse to the
-// same value. (Apple Silicon's mach timebase ticks at ~41.67 ns; see BENCHMARKS.md.)
+#if LOB_USE_RDTSC
+
+// Calibrate TSC ticks-per-nanosecond against steady_clock over ~200 ms. The TSC
+// runs at a fixed rate (invariant TSC), unrelated to core frequency, so it must
+// be calibrated at runtime rather than assumed from the nominal clock.
+static double calibrate_tsc_ticks_per_ns() {
+    using namespace std::chrono;
+    _mm_lfence();
+    const uint64_t c0 = __rdtsc();
+    _mm_lfence();
+    const auto t0 = steady_clock::now();
+    std::this_thread::sleep_for(milliseconds(200));
+    _mm_lfence();
+    const uint64_t c1 = __rdtsc();
+    _mm_lfence();
+    const auto t1 = steady_clock::now();
+    const double ns = static_cast<double>(duration_cast<nanoseconds>(t1 - t0).count());
+    return static_cast<double>(c1 - c0) / ns;   // ticks per nanosecond
+}
+
+// Median cost (in ticks) of an empty timed region — two back-to-back rdtsc reads
+// bracketed by lfence, identical in shape to the real measurement minus submit().
+// Subtracted from every sample so we report the operation, not the instrument.
+static uint64_t measure_rdtsc_overhead_ticks() {
+    const int N = 10'000;
+    std::vector<uint64_t> deltas;
+    deltas.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        _mm_lfence();
+        const uint64_t a = __rdtsc();
+        const uint64_t b = __rdtsc();
+        _mm_lfence();
+        deltas.push_back(b - a);
+    }
+    std::sort(deltas.begin(), deltas.end());
+    return deltas[deltas.size() / 2];
+}
+
+#else  // fallback: steady_clock
+
+// Smallest non-zero gap between two consecutive steady_clock reads (ns) — the
+// timer's real tick granularity. Sampled ~1000 times, minimum taken.
 static int64_t measure_clock_granularity_ns() {
     int64_t min_delta = INT64_MAX;
     for (int i = 0; i < 1000; ++i) {
@@ -29,6 +79,8 @@ static int64_t measure_clock_granularity_ns() {
     }
     return min_delta;
 }
+
+#endif
 
 // --- Google Benchmark: throughput ---
 static void BM_SubmitLimit(benchmark::State& state) {
@@ -57,15 +109,30 @@ BENCHMARK(BM_Cancel)->Unit(benchmark::kNanosecond);
 
 // --- Manual percentile benchmark (1M events) ---
 void run_percentile_benchmark() {
+    // Set up the timing backend and determine the timer's effective resolution
+    // in ns (one TSC tick for rdtsc; the tick granularity for steady_clock).
+#if LOB_USE_RDTSC
+    const double ticks_per_ns   = calibrate_tsc_ticks_per_ns();
+    const double resolution_ns  = 1.0 / ticks_per_ns;      // one TSC tick, in ns
+    const uint64_t overhead_ticks = measure_rdtsc_overhead_ticks();
+    const double overhead_ns    = overhead_ticks / ticks_per_ns;
+    std::cout << "Timer: rdtsc  calibrated " << ticks_per_ns << " GHz ("
+              << ticks_per_ns << " ticks/ns)\n";
+    std::cout << "rdtsc overhead: " << overhead_ns
+              << " ns (subtracted from every sample)\n";
+#else
+    const double resolution_ns = static_cast<double>(measure_clock_granularity_ns());
+    std::cout << "Timer: steady_clock  granularity " << resolution_ns << " ns\n";
+#endif
+
     // Refuse to produce meaningless numbers on a coarse timer.
-    const int64_t granularity = measure_clock_granularity_ns();
-    if (granularity > 10) {
+    if (resolution_ns > 10.0) {
         std::cerr << "\n!!! CLOCK RESOLUTION TOO COARSE — ABORTING BENCHMARK !!!\n";
-        std::cerr << "steady_clock tick granularity: " << granularity << " ns\n";
-        std::cerr << "A single submit() is faster than one clock tick, so every sample\n"
+        std::cerr << "effective timer resolution: " << resolution_ns << " ns\n";
+        std::cerr << "A single submit() is faster than one timer tick, so every sample\n"
                      "quantizes to 0 or one tick and p50/p95 collapse to the same value —\n"
                      "the measurement is meaningless on this hardware.\n";
-        std::cerr << "Run on a machine with a finer timer (Linux x86; see BENCHMARKS.md).\n";
+        std::cerr << "Run on a machine with a finer timer (Linux x86 rdtsc; see BENCHMARKS.md).\n";
         std::exit(1);
     }
 
@@ -82,10 +149,22 @@ void run_percentile_benchmark() {
         book.submit({++id, Side::Sell, OrderType::Limit, 10'100 + i, 1'000'000});
 
     for (int i = 0; i < N; ++i) {
-        auto t0 = std::chrono::steady_clock::now();
+#if LOB_USE_RDTSC
+        _mm_lfence();
+        const uint64_t t0 = __rdtsc();
         auto r = book.submit({++id, Side::Buy, OrderType::Limit, 10'100, 1});
-        auto t1 = std::chrono::steady_clock::now();
-        int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        const uint64_t t1 = __rdtsc();
+        _mm_lfence();
+        const uint64_t raw = t1 - t0;
+        const uint64_t adj = (raw > overhead_ticks) ? raw - overhead_ticks : 0;
+        const int64_t ns = static_cast<int64_t>(adj / ticks_per_ns + 0.5);
+#else
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = book.submit({++id, Side::Buy, OrderType::Limit, 10'100, 1});
+        const auto t1 = std::chrono::steady_clock::now();
+        const int64_t ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+#endif
         latencies.push_back(ns);
         if (r.trades.empty() && r.risk != RiskResult::OK) ++failures;
     }

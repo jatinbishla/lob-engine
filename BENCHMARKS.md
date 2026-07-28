@@ -20,8 +20,35 @@ section is always regenerated together from one host, never mixed across machine
    `PYTHONPATH=build python python/make_charts.py`
 4. Update the README performance table + microbenchmark line from that same run.
 
-The bench aborts (non-zero) if `steady_clock`'s tick granularity exceeds 10 ns —
-see below for why.
+The bench aborts (non-zero) if the active timer's **effective resolution exceeds
+10 ns** — see below for why.
+
+### Per-operation timing: rdtsc, not `clock_gettime`
+
+`clock_gettime` costs **~20 ns per call even through the vDSO** (no syscall) — a
+large fraction of the sub-100-ns operation we're trying to measure, and paid
+twice per sample (before and after). Timing `submit()` with it would fold the
+instrument's cost into the result. So on x86 the per-operation path reads the
+**timestamp counter directly**:
+
+```cpp
+_mm_lfence(); t0 = __rdtsc(); submit(...); t1 = __rdtsc(); _mm_lfence();
+```
+
+- **lfence serialization** — `rdtsc` is not ordered against surrounding
+  instructions on its own; the `lfence` fences stop the CPU from hoisting work
+  into or out of the timed region, so `t1 - t0` brackets exactly `submit()`.
+- **Overhead subtraction** — the median tick delta of ~10,000 *empty* timed
+  regions (same lfence/rdtsc shape, no `submit()`) is measured once and
+  subtracted from every sample, so we report the operation, not the counter read.
+- **Runtime calibration** — the invariant TSC advances at a fixed rate unrelated
+  to core frequency, so ticks-per-nanosecond is calibrated at startup against
+  `steady_clock` over ~200 ms rather than assumed. The calibrated frequency and
+  the measured overhead are printed at the top of every run.
+
+On non-x86 hosts the bench falls back to `steady_clock` (and, on Apple Silicon,
+the resolution guard below stops it). The rdtsc resolution is one tick (sub-ns on
+any multi-GHz TSC), so it clears the 10 ns guard easily.
 
 ### Apple Silicon cannot measure this path
 
@@ -36,8 +63,10 @@ committed by accident. Benchmark on Linux x86 (invariant-TSC, ns-resolution) ins
 
 ## Measurement boundary
 `order submitted → trades vector returned` — no I/O, no logging, no printing inside
-the loop. Per-event latency is measured with `std::chrono::steady_clock`; throughput
-microbenchmarks use Google Benchmark.
+the loop. Per-event latency is measured with the x86 timestamp counter (`rdtsc`,
+lfence-serialized, overhead-subtracted) where available, falling back to
+`std::chrono::steady_clock` on other architectures; throughput microbenchmarks use
+Google Benchmark. See *Per-operation timing* above.
 
 - **CPU:** 6 cores / 12 threads @ ~2.1 GHz. Caches: L1d 32 KiB ×6, L2 512 KiB ×6, L3 4 MiB ×2.
 - **OS:** Windows 11
