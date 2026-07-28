@@ -20,6 +20,14 @@ target_include_directories(lob PUBLIC include)
 # module (lobpy) on Linux; harmless for the executables that link it statically.
 set_target_properties(lob PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Baseline comparison: disable the object pool (revert to the system allocator)
+# so the benchmark can measure the pool's effect on identical infrastructure.
+# PUBLIC so consumers (the bench) compile against the matching OrderList type.
+option(LOB_NO_POOL "Disable the object pool; use the system allocator (baseline A/B)" OFF)
+if(LOB_NO_POOL)
+  target_compile_definitions(lob PUBLIC LOB_NO_POOL)
+endif()
+
 # Demo executable
 add_executable(demo src/main.cpp)
 target_link_libraries(demo PRIVATE lob)

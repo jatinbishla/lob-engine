@@ -77,12 +77,54 @@ Google Benchmark. See *Per-operation timing* above.
 > back before any numbers below were recorded, so these are honest optimized-build figures.
 
 ## Workloads
-- **Percentile bench (1M events):** 100 deep resting asks pre-loaded; each event is a
-  buy that crosses and fully fills 1 lot. This path *matches but never rests*, so it does
-  **no heap allocation** — it measures the matching loop + `std::map` best-level lookup.
-- **`BM_SubmitLimit`:** repeated resting limit orders across 10 price levels. This path
-  **allocates a queue node per order**, so it is the one that exercises the allocator.
+
+> **Correction.** The percentile harness was previously described as *crossing* a
+> pre-loaded ask wall. It never did: a full-size wall (`qty 1,000,000`) is risk-rejected
+> (`REJECT_SIZE`), so the book started empty and every order **rested**. The harness has
+> always measured the resting-insert path — which is exactly where the object pool
+> matters — so the historical pool numbers below stand as resting-path figures.
+
+- **Percentile bench (1M events):** 1,000,000 limit orders **rest** across a band of 100
+  price levels — no crossing (`max trades per submit: 0`). Each insert allocates a
+  `std::list` node (object pool unless `LOB_NO_POOL`) **and** an `index_` `unordered_map`
+  node (always the system allocator; ~20 rehashes over the run). This is the
+  allocation-bound submit path, measured at percentiles.
+- **`BM_SubmitLimit`:** resting limit orders across 10 price levels — the *same kind* of
+  path (resting insert), a different book shape. So its ~95.9 ns mean and the percentile
+  p50 (~40 ns) are the **same operation measured two ways**, not a contradiction: 10 levels
+  vs 100, and Google-Benchmark mean vs per-op rdtsc.
 - **`BM_Cancel`:** cancel + re-insert against a 10k-order book (allocator + index churn).
+
+### Baseline A/B — object pool on vs off
+Build twice, run the same harness, so the pool's effect is measured on identical hardware:
+```
+cmake -B build-pool   -DCMAKE_BUILD_TYPE=Release                  && cmake --build build-pool   -j
+cmake -B build-nopool -DCMAKE_BUILD_TYPE=Release -DLOB_NO_POOL=ON && cmake --build build-nopool -j
+taskset -c 1 ./build-pool/bench      # Allocator: object pool (arena)
+taskset -c 1 ./build-nopool/bench    # Allocator: system (pool disabled)
+```
+`LOB_NO_POOL` reverts `OrderList` to `std::list<Order>` (system allocator). Because every
+order rests, pool-off pays a `malloc` for the list node on *every* insert; pool-on draws
+it from the arena (a chunk `malloc` only every 4096 nodes). The benchmark workflow runs
+both variants and uploads both outputs.
+
+### Why the tail is bimodal (p95 ≪ p99)
+`run_percentile_benchmark()` classifies every slow sample (> 8× p50). The jump is **not**
+new price-level creation (only ~100 levels over 1M inserts) and **not** the trades vector
+(no crossing → no trades). It is **heap allocation on the insert**:
+- the `std::list` node — removed by the object pool;
+- the `index_` `unordered_map` node and its ~20 rehashes — **not** pool-served.
+
+So the pool tightens the tail (fewer `malloc`s per insert), but a residual remains from the
+O(1)-cancel hash index — a candidate for a future intrusive index. The per-run breakdown
+(new-level / index-rehash / neither) prints under *Tail analysis*.
+
+### Limitation — rdtsc overhead vs a ~40 ns operation
+The measured `rdtsc` overhead is **~10 ns** (printed each run, subtracted per sample). At a
+p50 near 40 ns that is a meaningful fraction of the signal: subtraction uses the *median*
+empty-region cost, so per-read jitter still lands in the measurement. Treat sub-50 ns
+figures as indicative, not exact. The tail (p99/p99.9) — where the pool's effect lives — is
+far larger than the overhead and unaffected.
 
 ---
 

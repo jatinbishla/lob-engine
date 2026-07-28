@@ -136,23 +136,43 @@ void run_percentile_benchmark() {
         std::exit(1);
     }
 
+#ifdef LOB_NO_POOL
+    const char* allocator_label = "system (pool disabled)";
+#else
+    const char* allocator_label = "object pool (arena)";
+#endif
+
+    // Resting-insert workload. There are no asks to cross (a full-size ask wall
+    // would be risk-rejected), so every order rests: this measures the submit
+    // path that *allocates* — one std::list node per order (served by the object
+    // pool unless LOB_NO_POOL) plus one index_ (unordered_map) node, which is
+    // always the system allocator and periodically forces a rehash. Orders are
+    // spread across a band of price levels to keep the bids map realistic.
     const int N = 1'000'000;
+    const Price kBase = 10'000;
+    const int   kBand = 100;           // number of resting price levels
     OrderBook book;
-    std::vector<int64_t> latencies;
+    std::vector<int64_t> latencies;    // per-op latency, in submit order
+    std::vector<uint8_t> cause;        // parallel: 0=neither, 1=new level, 2=index rehash
     latencies.reserve(N);
+    cause.reserve(N);
 
     OrderId id = 0;
-    int failures = 0;
-
-    // Pre-populate with some asks to cross against
-    for (int i = 0; i < 100; ++i)
-        book.submit({++id, Side::Sell, OrderType::Limit, 10'100 + i, 1'000'000});
+    size_t rejected = 0;               // sanity: resting orders must never be risk-rejected
+    size_t levels_created_total = 0;   // std::map<Price> node allocations
+    size_t index_rehashes_total = 0;   // unordered_map bucket-array reallocations
+    size_t max_trades = 0;             // 0 confirms the pure resting path (no crossing)
 
     for (int i = 0; i < N; ++i) {
+        const Price px = kBase + (i % kBand);
+        // These reads bracket the call but sit OUTSIDE the timed region, so the
+        // instrumentation never inflates the measurement.
+        const std::size_t lv_before  = book.level_count();
+        const std::size_t bkt_before = book.index_bucket_count();
 #if LOB_USE_RDTSC
         _mm_lfence();
         const uint64_t t0 = __rdtsc();
-        auto r = book.submit({++id, Side::Buy, OrderType::Limit, 10'100, 1});
+        auto r = book.submit({++id, Side::Buy, OrderType::Limit, px, 10});
         const uint64_t t1 = __rdtsc();
         _mm_lfence();
         const uint64_t raw = t1 - t0;
@@ -160,30 +180,70 @@ void run_percentile_benchmark() {
         const int64_t ns = static_cast<int64_t>(adj / ticks_per_ns + 0.5);
 #else
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = book.submit({++id, Side::Buy, OrderType::Limit, 10'100, 1});
+        auto r = book.submit({++id, Side::Buy, OrderType::Limit, px, 10});
         const auto t1 = std::chrono::steady_clock::now();
         const int64_t ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
 #endif
+        const bool made_level = book.level_count() > lv_before;
+        const bool rehashed   = book.index_bucket_count() > bkt_before;
+        if (made_level) ++levels_created_total;
+        if (rehashed)   ++index_rehashes_total;
+        if (r.trades.size() > max_trades) max_trades = r.trades.size();
+        if (r.risk != RiskResult::OK)     ++rejected;
         latencies.push_back(ns);
-        if (r.trades.empty() && r.risk != RiskResult::OK) ++failures;
+        cause.push_back(made_level ? 1 : (rehashed ? 2 : 0));
     }
 
-    std::sort(latencies.begin(), latencies.end());
-
+    // Percentiles from a sorted copy; keep `latencies` in submit order so it
+    // stays aligned with `cause` for the tail analysis below.
+    std::vector<int64_t> sorted = latencies;
+    std::sort(sorted.begin(), sorted.end());
     auto percentile = [&](double p) -> int64_t {
-        size_t idx = static_cast<size_t>(p / 100.0 * (latencies.size() - 1));
-        return latencies[idx];
+        size_t idx = static_cast<size_t>(p / 100.0 * (sorted.size() - 1));
+        return sorted[idx];
     };
+    const int64_t p50 = percentile(50);
 
     std::cout << "\n=== LOB Engine Latency Benchmark ===\n";
-    std::cout << "Core: 0  Events: 1,000,000  Failures: " << failures << "\n";
-    std::cout << "  p50:    " << percentile(50)  << " ns\n";
+    std::cout << "Core: 0  Events: 1,000,000  Rejected: " << rejected << "\n";
+    std::cout << "Allocator: " << allocator_label << "\n";
+    std::cout << "  p50:    " << p50            << " ns\n";
     std::cout << "  p95:    " << percentile(95)  << " ns\n";
     std::cout << "  p99:    " << percentile(99)  << " ns\n";
     std::cout << "  p99.9:  " << percentile(99.9) << " ns\n";
-    std::cout << "Classification: price-time priority matching, object pool (arena), std::map levels\n";
+    std::cout << "Classification: resting limit inserts across " << kBand
+              << " price levels, " << allocator_label << ", std::map levels\n";
     std::cout << "Boundary: order submitted -> trades vector returned (no I/O, no logging)\n";
+
+    // --- Tail analysis: what makes the p95->p99 jump bimodal? ---
+    // Every order rests, so each submit performs two heap allocations: a
+    // std::list node (the object pool serves this unless LOB_NO_POOL) and an
+    // index_ unordered_map node (always the system allocator, with a periodic
+    // rehash). We classify each slow sample as: it created a new price level
+    // (std::map node), it triggered an index rehash (bucket-array realloc), or
+    // neither — the residual being the per-insert node malloc slow-path + jitter.
+    const int64_t slow_threshold = std::max<int64_t>(200, 8 * p50);
+    size_t slow = 0, slow_level = 0, slow_rehash = 0, slow_other = 0;
+    for (size_t i = 0; i < latencies.size(); ++i) {
+        if (latencies[i] > slow_threshold) {
+            ++slow;
+            if      (cause[i] == 1) ++slow_level;
+            else if (cause[i] == 2) ++slow_rehash;
+            else                    ++slow_other;
+        }
+    }
+    std::cout << "--- Tail analysis (bimodal p95->p99) ---\n";
+    std::cout << "slow threshold:             " << slow_threshold << " ns (8x p50)\n";
+    std::cout << "slow submits (> threshold): " << slow << " / " << N
+              << "  (" << (100.0 * static_cast<double>(slow) / N) << "%)\n";
+    std::cout << "  new price level (std::map node):        " << slow_level
+              << "   [levels created total: " << levels_created_total << "]\n";
+    std::cout << "  index_ rehash (unordered_map realloc):  " << slow_rehash
+              << "   [rehashes total: " << index_rehashes_total << "]\n";
+    std::cout << "  neither (node malloc slow-path/jitter): " << slow_other << "\n";
+    std::cout << "max trades per submit: " << max_trades
+              << "  (0 = pure resting path, no crossing)\n";
 
     // Dump raw per-op samples so the histogram is plotted from real data
     // (see python/make_charts.py), not a modeled distribution.
@@ -191,8 +251,8 @@ void run_percentile_benchmark() {
     std::ofstream csv(csv_path);
     if (csv) {
         csv << "latency_ns\n";
-        for (int64_t ns : latencies) csv << ns << '\n';
-        std::cout << "Wrote " << latencies.size() << " samples to " << csv_path << "\n";
+        for (int64_t ns : sorted) csv << ns << '\n';
+        std::cout << "Wrote " << sorted.size() << " samples to " << csv_path << "\n";
     } else {
         std::cout << "WARNING: could not open " << csv_path
                   << " (run from the repo root so data/ exists)\n";

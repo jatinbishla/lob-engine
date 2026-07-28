@@ -10,8 +10,14 @@
 namespace lob {
 
 // Order queue at a price level. Backed by the arena pool so resting an order
-// costs no system allocation on the hot path. (M6 optimization — Opt 1.)
+// costs no system allocation on the hot path (M6 optimization — Opt 1), unless
+// LOB_NO_POOL is defined, which reverts to the system allocator for the baseline
+// A/B comparison (see BENCHMARKS.md).
+#ifdef LOB_NO_POOL
+using OrderList = std::list<Order>;
+#else
 using OrderList = std::list<Order, PoolAllocator<Order>>;
+#endif
 
 struct Level {
     OrderList orders;    // front = oldest = highest priority
@@ -39,6 +45,15 @@ public:
     bool best_bid(Price& out) const;
     bool best_ask(Price& out) const;
     Quantity depth_at(Side side, Price price) const;
+
+    // Total number of occupied price levels (bids + asks). O(1). Used by the
+    // benchmark to detect when a submit creates a new map node (a level).
+    std::size_t level_count() const { return bids_.size() + asks_.size(); }
+
+    // Bucket count of the O(1)-cancel index (unordered_map). Used by the
+    // benchmark to detect when a resting insert triggers a rehash (a large
+    // bucket-array reallocation) — a tail source the object pool does not cover.
+    std::size_t index_bucket_count() const { return index_.bucket_count(); }
 
 private:
     // Bids: highest price first (std::greater); Asks: lowest price first (default)

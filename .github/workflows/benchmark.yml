@@ -14,19 +14,29 @@ jobs:
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake
 
-      - name: Configure (Release, no Python)
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_PYTHON=OFF
+      # Baseline A/B: two builds of the same bench, pool on vs off, so the pool's
+      # effect on the tail is measured on identical infrastructure.
+      - name: Configure + build (object pool ON)
+        run: |
+          cmake -B build-pool -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_PYTHON=OFF
+          cmake --build build-pool -j"$(nproc)"
 
-      - name: Build
-        run: cmake --build build -j"$(nproc)"
+      - name: Configure + build (object pool OFF, system allocator)
+        run: |
+          cmake -B build-nopool -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_PYTHON=OFF -DLOB_NO_POOL=ON
+          cmake --build build-nopool -j"$(nproc)"
 
-      - name: Run benchmark (pinned to core 1)
-        run: taskset -c 1 ./build/bench 2>&1 | tee bench_output.txt
+      - name: Run — pool OFF (baseline), pinned to core 1
+        run: taskset -c 1 ./build-nopool/bench 2>&1 | tee bench_output_nopool.txt
+
+      - name: Run — pool ON (canonical), pinned to core 1
+        # Runs last so data/latency_samples.csv holds the pooled samples the chart uses.
+        run: taskset -c 1 ./build-pool/bench 2>&1 | tee bench_output_pool.txt
 
       - name: Install Python plotting deps
         run: sudo apt-get install -y python3-matplotlib python3-numpy python3-pandas
 
-      - name: Regenerate charts from the samples
+      - name: Regenerate charts from the (pooled) samples
         run: python3 python/make_charts.py
 
       - name: Upload benchmark results
@@ -35,6 +45,7 @@ jobs:
           name: benchmark-results
           path: |
             images/latency_hist.png
-            bench_output.txt
+            bench_output_pool.txt
+            bench_output_nopool.txt
             data/latency_samples.csv
             BENCHMARKS.md
