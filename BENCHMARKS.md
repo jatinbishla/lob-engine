@@ -157,7 +157,16 @@ edit by hand; anything between the markers is overwritten. The historical narrat
 (*Baseline* / *After Opt 1*) is kept as the optimization story.
 
 <!-- BENCH:START -->
-_No automated run has landed yet — dispatch the Benchmark workflow to populate this._
+| Metric | Object pool | System allocator |
+|:--|--:|--:|
+| p50 | 40 ns | 60 ns |
+| p95 | 60 ns | 100 ns |
+| p99 | 1473 ns | 1502 ns |
+| p99.9 | 2184 ns | 4398 ns |
+| insert · BM_SubmitLimit | 92.3 ns | 106 ns |
+| cancel · BM_Cancel | 53.4 ns | 57.7 ns |
+
+_Runner: **AMD EPYC 7763 64-Core Processor** · TSC 2.44548 GHz · rdtsc overhead 10.223 ns · load 2.35, 1.29, 0.51 · 2026-07-28 15:21 UTC · 1,000,000 events, core-pinned. Object pool = `object pool (arena)`, system = `system (pool disabled)`._
 <!-- BENCH:END -->
 
 ---
