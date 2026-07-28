@@ -1,5 +1,39 @@
 # BENCHMARKS.md
 
+## Methodology
+
+**All committed numbers come from a single machine.** Latency percentiles, the
+throughput microbenchmarks, and the histogram in the README are meaningless to
+compare unless they share one CPU, clock, and toolchain — so the whole benchmark
+section is always regenerated together from one host, never mixed across machines.
+
+**Canonical host:** the Windows 11 / GCC 15.2 machine described under
+*Measurement boundary* below. All figures on this page were measured there.
+
+**Required regeneration procedure:**
+
+1. Linux x86 (or the canonical Windows host), **Release** build:
+   `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j`
+2. Pin to one core to cut scheduler jitter, then run the bench from the repo root:
+   `taskset -c 2 ./build/bench`   (writes `data/latency_samples.csv` + prints percentiles)
+3. Regenerate the charts from that CSV:
+   `PYTHONPATH=build python python/make_charts.py`
+4. Update the README performance table + microbenchmark line from that same run.
+
+The bench aborts (non-zero) if `steady_clock`'s tick granularity exceeds 10 ns —
+see below for why.
+
+### Apple Silicon cannot measure this path
+
+On Apple Silicon, `std::chrono::steady_clock` is backed by the **mach timebase,
+which ticks at ~41.67 ns (24 MHz)**. A single `submit()` completes in *less* than
+one tick, so every per-op sample quantizes to 0 or one tick: the distribution
+piles into the 0/41/42 ns buckets and **p50 and p95 collapse to the same value**.
+The result is not a measurement of the engine — it is a measurement of the clock.
+The clock-resolution guard in `run_percentile_benchmark()` detects this (measured
+granularity ≈ 41 ns) and refuses to run, so coarse-timer numbers can never be
+committed by accident. Benchmark on Linux x86 (invariant-TSC, ns-resolution) instead.
+
 ## Measurement boundary
 `order submitted → trades vector returned` — no I/O, no logging, no printing inside
 the loop. Per-event latency is measured with `std::chrono::steady_clock`; throughput

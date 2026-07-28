@@ -43,10 +43,10 @@ object-pool optimization. Full methodology and baseline in [BENCHMARKS.md](BENCH
 
 | Percentile | Latency |
 |-----------:|:--------|
-| p50        | 42 ns |
-| p95        | 42 ns |
-| p99        | 84 ns |
-| p99.9      | ~2.2 µs (object pool keeps the tail off the system allocator) |
+| p50        | ~100 ns |
+| p95        | 100–400 ns |
+| p99        | 200–900 ns |
+| p99.9      | ~6 µs (≈3–4× tighter tail vs. system allocator) |
 
 Microbenchmarks (Google Benchmark, median of 3): resting insert ~122 ns
 (−38% vs. baseline), cancel ~100 ns (−37%).
