@@ -101,6 +101,22 @@ def build_block(pool, nopool):
         f"shows no tail advantage here (p99.9 {cell(pool['crossing/matching']['p99.9'])} "
         f"vs {cell(nopool['crossing/matching']['p99.9'])})._"
     )
+    # An implausibly slow system-allocator insert (seen once at 317 ns vs a ~100 ns
+    # representative) would read as a huge pool win; flag it so the row isn't cited
+    # as ~2.8x when the reproducible insert improvement is ~1.3x.
+    insert_note = ""
+    try:
+        ip, isys = float(pool["insert"]), float(nopool["insert"])
+        if isys > 1.6 * ip:
+            insert_note = (
+                f"_Note: the {cell(nopool['insert'])} system-allocator insert is an outlier for "
+                f"this runner (prior runs measured 93.7 ns and 106 ns); the representative insert "
+                f"improvement is ~1.3×, not the {isys / ip:.1f}× this table implies "
+                f"(see Reproducibility in BENCHMARKS.md)._"
+            )
+    except (TypeError, ValueError):
+        pass
+
     parts = [
         workload_table("Resting insert",
                        "allocation-bound; the object pool's path",
@@ -118,6 +134,8 @@ def build_block(pool, nopool):
         f"| insert · BM_SubmitLimit | {cell(pool['insert'])} | {cell(nopool['insert'])} |",
         f"| cancel · BM_Cancel | {cell(pool['cancel'])} | {cell(nopool['cancel'])} |",
     ]
+    if insert_note:
+        parts += ["", insert_note]
 
     date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     pool_mhz, nopool_mhz = cell(pool["cpu_mhz"], " MHz"), cell(nopool["cpu_mhz"], " MHz")

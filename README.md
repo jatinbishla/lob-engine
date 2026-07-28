@@ -69,6 +69,8 @@ _On the matching path allocation is off the critical path, so the object pool sh
 | insert · BM_SubmitLimit | 112 ns | 317 ns |
 | cancel · BM_Cancel | 56.5 ns | 60.5 ns |
 
+_Note: the 317 ns system-allocator insert is an outlier for this runner (prior runs measured 93.7 ns and 106 ns); the representative insert improvement is ~1.3×, not the ~2.8× this table implies (see Reproducibility in BENCHMARKS.md)._
+
 _Runner: **AMD EPYC 7763 64-Core Processor** · core clock pool 2445.426000 MHz / no-pool 2509.484000 MHz · TSC 2.44552 GHz · rdtsc overhead 10.2228 ns · load-before pool 2.39 / no-pool 4.20 · 2026-07-28 16:00 UTC · 1,000,000 events/workload, core-pinned._
 
 > **Frequency-scaling caveat.** The two variants ran at different core clocks (pool 2445.426000 MHz vs no-pool 2509.484000 MHz on this shared runner), so the **p50/p95 comparison across allocators is confounded by clock, not just allocator**. The **p99.9 comparison is the robust one**: tail behaviour is allocator-dominated (malloc / arena grow), not clock-dominated.
