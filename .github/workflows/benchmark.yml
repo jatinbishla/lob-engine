@@ -30,12 +30,17 @@ jobs:
           cmake -B build-nopool -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_PYTHON=OFF -DLOB_NO_POOL=ON
           cmake --build build-nopool -j"$(nproc)"
 
-      - name: Run — pool OFF (baseline), pinned to core 1
-        run: taskset -c 1 ./build-nopool/bench 2>&1 | tee bench_output_nopool.txt
-
-      - name: Run — pool ON (canonical), pinned to core 1
-        # Runs last so data/latency_samples.csv holds the pooled samples the chart uses.
-        run: taskset -c 1 ./build-pool/bench 2>&1 | tee bench_output_pool.txt
+      # Strictly sequential: run one variant to completion, idle 30 s so the other
+      # doesn't contend for the core / cache / turbo budget, then run the second.
+      # Load average is printed (and recorded into each output) right before each run.
+      - name: Run both variants sequentially (pool ON last so the CSV is pooled)
+        run: |
+          echo "load before no-pool run: $(cat /proc/loadavg)" | tee bench_output_nopool.txt
+          taskset -c 1 ./build-nopool/bench 2>&1 | tee -a bench_output_nopool.txt
+          echo "Idling 30 s to isolate the two runs..."
+          sleep 30
+          echo "load before pool run: $(cat /proc/loadavg)" | tee bench_output_pool.txt
+          taskset -c 1 ./build-pool/bench 2>&1 | tee -a bench_output_pool.txt
 
       - name: Install Python plotting deps
         run: sudo apt-get install -y python3-matplotlib python3-numpy python3-pandas

@@ -84,11 +84,19 @@ Google Benchmark. See *Per-operation timing* above.
 > always measured the resting-insert path — which is exactly where the object pool
 > matters — so the historical pool numbers below stand as resting-path figures.
 
-- **Percentile bench (1M events):** 1,000,000 limit orders **rest** across a band of 100
+The percentile bench measures **two workloads** over one shared, calibrated timer,
+reported separately as *resting insert* and *crossing/matching*:
+
+- **Resting insert (1M events):** 1,000,000 limit orders **rest** across a band of 100
   price levels — no crossing (`max trades per submit: 0`). Each insert allocates a
   `std::list` node (object pool unless `LOB_NO_POOL`) **and** an `index_` `unordered_map`
   node (always the system allocator; ~20 rehashes over the run). This is the
-  allocation-bound submit path, measured at percentiles.
+  allocation-bound submit path, and it feeds the latency histogram.
+- **Crossing / matching (1M events):** a two-sided book is pre-loaded with resting
+  liquidity (via `rest()`, so a deep book is built without tripping the risk limits), then
+  aggressive orders **alternate buy/sell** so they actually fill (`max trades per submit: 1`)
+  while net inventory stays within the risk cap. This exercises the match loop +
+  trades-vector allocation + node free — *not* the resting-insert path.
 - **`BM_SubmitLimit`:** resting limit orders across 10 price levels — the *same kind* of
   path (resting insert), a different book shape. So its ~95.9 ns mean and the percentile
   p50 (~40 ns) are the **same operation measured two ways**, not a contradiction: 10 levels
@@ -125,6 +133,19 @@ p50 near 40 ns that is a meaningful fraction of the signal: subtraction uses the
 empty-region cost, so per-read jitter still lands in the measurement. Treat sub-50 ns
 figures as indicative, not exact. The tail (p99/p99.9) — where the pool's effect lives — is
 far larger than the overhead and unaffected.
+
+### Limitation — CPU frequency scaling confounds cross-variant p50/p95
+The two allocator variants build and run as separate processes, and on a shared runner the
+core frequency scales (turbo, thermal, neighbour load). A single dispatch has been observed
+running one variant at **3244 MHz** and the other at **2445 MHz** — a ~33% clock difference.
+Because p50/p95 sit on a fast, allocation-light path dominated by raw instruction throughput,
+that clock gap **directly confounds the cross-variant p50/p95 comparison**: a pool-vs-system
+delta at the median can be clock, not allocator. The **p99.9 comparison is the robust one** —
+tail behaviour is dominated by allocator slow-paths (`malloc` / arena `grow` / rehash), which
+dwarf a ~30% clock difference. The bench logs the observed core frequency per run
+(`CPU frequency (observed): … MHz`), and the auto-generated results table repeats it with the
+same caveat. Pinning to a fixed frequency (`cpupower frequency-set`) would remove the confound
+but is not available on GitHub-hosted runners.
 
 ---
 

@@ -7,8 +7,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <fstream>
+#include <string>
 #include "lob/order_book.hpp"
 
 // Per-op timing backend: the x86 timestamp counter (rdtsc) where available,
@@ -107,156 +109,218 @@ static void BM_Cancel(benchmark::State& state) {
 }
 BENCHMARK(BM_Cancel)->Unit(benchmark::kNanosecond);
 
-// --- Manual percentile benchmark (1M events) ---
-void run_percentile_benchmark() {
-    // Set up the timing backend and determine the timer's effective resolution
-    // in ns (one TSC tick for rdtsc; the tick granularity for steady_clock).
+// Observed core frequency in MHz (Linux only). Core frequency scales on shared
+// runners and is NOT the invariant TSC rate, so it is logged separately: a large
+// clock difference between the two variant runs confounds cross-variant p50/p95
+// comparison (see BENCHMARKS.md).
+static double read_cpu_mhz() {
+#if defined(__linux__)
+    if (std::ifstream f("/sys/devices/system/cpu/cpu1/cpufreq/scaling_cur_freq"); f) {
+        double khz = 0;
+        if (f >> khz) return khz / 1000.0;   // pinned core's current frequency
+    }
+    std::ifstream f("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(f, line))
+        if (line.rfind("cpu MHz", 0) == 0) {
+            const auto pos = line.find(':');
+            if (pos != std::string::npos) return std::atof(line.c_str() + pos + 1);
+        }
+#endif
+    return 0.0;
+}
+
+// Shared timing backend, set up once and reused by every workload.
+struct Timing {
 #if LOB_USE_RDTSC
-    const double ticks_per_ns   = calibrate_tsc_ticks_per_ns();
-    const double resolution_ns  = 1.0 / ticks_per_ns;      // one TSC tick, in ns
-    const uint64_t overhead_ticks = measure_rdtsc_overhead_ticks();
-    const double overhead_ns    = overhead_ticks / ticks_per_ns;
-    std::cout << "Timer: rdtsc  calibrated " << ticks_per_ns << " GHz ("
-              << ticks_per_ns << " ticks/ns)\n";
-    std::cout << "rdtsc overhead: " << overhead_ns
+    double   ticks_per_ns   = 0;
+    uint64_t overhead_ticks = 0;
+#endif
+    double resolution_ns = 0;
+};
+
+static Timing setup_timing() {
+    Timing tm;
+#if LOB_USE_RDTSC
+    tm.ticks_per_ns   = calibrate_tsc_ticks_per_ns();
+    tm.resolution_ns  = 1.0 / tm.ticks_per_ns;               // one TSC tick, in ns
+    tm.overhead_ticks = measure_rdtsc_overhead_ticks();
+    std::cout << "Timer: rdtsc  calibrated " << tm.ticks_per_ns << " GHz ("
+              << tm.ticks_per_ns << " ticks/ns)\n";
+    std::cout << "rdtsc overhead: " << (tm.overhead_ticks / tm.ticks_per_ns)
               << " ns (subtracted from every sample)\n";
 #else
-    const double resolution_ns = static_cast<double>(measure_clock_granularity_ns());
-    std::cout << "Timer: steady_clock  granularity " << resolution_ns << " ns\n";
+    tm.resolution_ns = static_cast<double>(measure_clock_granularity_ns());
+    std::cout << "Timer: steady_clock  granularity " << tm.resolution_ns << " ns\n";
 #endif
-
-    // Refuse to produce meaningless numbers on a coarse timer.
-    if (resolution_ns > 10.0) {
+    if (tm.resolution_ns > 10.0) {          // refuse meaningless numbers on a coarse timer
         std::cerr << "\n!!! CLOCK RESOLUTION TOO COARSE — ABORTING BENCHMARK !!!\n";
-        std::cerr << "effective timer resolution: " << resolution_ns << " ns\n";
+        std::cerr << "effective timer resolution: " << tm.resolution_ns << " ns\n";
         std::cerr << "A single submit() is faster than one timer tick, so every sample\n"
                      "quantizes to 0 or one tick and p50/p95 collapse to the same value —\n"
                      "the measurement is meaningless on this hardware.\n";
         std::cerr << "Run on a machine with a finer timer (Linux x86 rdtsc; see BENCHMARKS.md).\n";
         std::exit(1);
     }
+    return tm;
+}
 
-#ifdef LOB_NO_POOL
-    const char* allocator_label = "system (pool disabled)";
-#else
-    const char* allocator_label = "object pool (arena)";
-#endif
+// Per-op latencies plus a per-sample cause tag, filled by measure().
+struct Samples {
+    std::vector<int64_t> latency;   // submit order
+    std::vector<uint8_t> cause;     // 0=neither, 1=new level, 2=index rehash
+    size_t levels_created = 0, index_rehashes = 0, max_trades = 0, rejected = 0;
+};
 
-    // Resting-insert workload. There are no asks to cross (a full-size ask wall
-    // would be risk-rejected), so every order rests: this measures the submit
-    // path that *allocates* — one std::list node per order (served by the object
-    // pool unless LOB_NO_POOL) plus one index_ (unordered_map) node, which is
-    // always the system allocator and periodically forces a rehash. Orders are
-    // spread across a band of price levels to keep the bids map realistic.
-    const int N = 1'000'000;
-    const Price kBase = 10'000;
-    const int   kBand = 100;           // number of resting price levels
-    OrderBook book;
-    std::vector<int64_t> latencies;    // per-op latency, in submit order
-    std::vector<uint8_t> cause;        // parallel: 0=neither, 1=new level, 2=index rehash
-    latencies.reserve(N);
-    cause.reserve(N);
-
-    OrderId id = 0;
-    size_t rejected = 0;               // sanity: resting orders must never be risk-rejected
-    size_t levels_created_total = 0;   // std::map<Price> node allocations
-    size_t index_rehashes_total = 0;   // unordered_map bucket-array reallocations
-    size_t max_trades = 0;             // 0 confirms the pure resting path (no crossing)
-
+// Run N timed submit()s. The next order is produced OUTSIDE the timed region by
+// `next` (so its cost is never measured); the timed region brackets only submit()
+// with lfence/rdtsc (or steady_clock on the fallback). The level/bucket reads that
+// classify each sample also sit outside the timed region.
+static Samples measure([[maybe_unused]] const Timing& tm, OrderBook& book,
+                       const std::function<Order(int)>& next, int N) {
+    Samples s;
+    s.latency.reserve(N);
+    s.cause.reserve(N);
     for (int i = 0; i < N; ++i) {
-        const Price px = kBase + (i % kBand);
-        // These reads bracket the call but sit OUTSIDE the timed region, so the
-        // instrumentation never inflates the measurement.
+        const Order o = next(i);
         const std::size_t lv_before  = book.level_count();
         const std::size_t bkt_before = book.index_bucket_count();
 #if LOB_USE_RDTSC
         _mm_lfence();
         const uint64_t t0 = __rdtsc();
-        auto r = book.submit({++id, Side::Buy, OrderType::Limit, px, 10});
+        auto r = book.submit(o);
         const uint64_t t1 = __rdtsc();
         _mm_lfence();
         const uint64_t raw = t1 - t0;
-        const uint64_t adj = (raw > overhead_ticks) ? raw - overhead_ticks : 0;
-        const int64_t ns = static_cast<int64_t>(adj / ticks_per_ns + 0.5);
+        const uint64_t adj = (raw > tm.overhead_ticks) ? raw - tm.overhead_ticks : 0;
+        const int64_t ns = static_cast<int64_t>(adj / tm.ticks_per_ns + 0.5);
 #else
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = book.submit({++id, Side::Buy, OrderType::Limit, px, 10});
+        auto r = book.submit(o);
         const auto t1 = std::chrono::steady_clock::now();
         const int64_t ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
 #endif
         const bool made_level = book.level_count() > lv_before;
         const bool rehashed   = book.index_bucket_count() > bkt_before;
-        if (made_level) ++levels_created_total;
-        if (rehashed)   ++index_rehashes_total;
-        if (r.trades.size() > max_trades) max_trades = r.trades.size();
-        if (r.risk != RiskResult::OK)     ++rejected;
-        latencies.push_back(ns);
-        cause.push_back(made_level ? 1 : (rehashed ? 2 : 0));
+        if (made_level) ++s.levels_created;
+        if (rehashed)   ++s.index_rehashes;
+        if (r.trades.size() > s.max_trades) s.max_trades = r.trades.size();
+        if (r.risk != RiskResult::OK)       ++s.rejected;
+        s.latency.push_back(ns);
+        s.cause.push_back(made_level ? 1 : (rehashed ? 2 : 0));
     }
+    return s;
+}
 
-    // Percentiles from a sorted copy; keep `latencies` in submit order so it
-    // stays aligned with `cause` for the tail analysis below.
-    std::vector<int64_t> sorted = latencies;
+// Sort, print the labelled percentile block + tail breakdown, and optionally dump
+// the samples CSV that feeds the histogram.
+static void report(const std::string& label, const char* allocator_label,
+                   Samples& s, int N, bool write_csv) {
+    std::vector<int64_t> sorted = s.latency;
     std::sort(sorted.begin(), sorted.end());
-    auto percentile = [&](double p) -> int64_t {
-        size_t idx = static_cast<size_t>(p / 100.0 * (sorted.size() - 1));
-        return sorted[idx];
+    auto pct = [&](double p) -> int64_t {
+        return sorted[static_cast<size_t>(p / 100.0 * (sorted.size() - 1))];
     };
-    const int64_t p50 = percentile(50);
+    const int64_t p50 = pct(50);
 
-    std::cout << "\n=== LOB Engine Latency Benchmark ===\n";
-    std::cout << "Core: 0  Events: 1,000,000  Rejected: " << rejected << "\n";
-    std::cout << "Allocator: " << allocator_label << "\n";
-    std::cout << "  p50:    " << p50            << " ns\n";
-    std::cout << "  p95:    " << percentile(95)  << " ns\n";
-    std::cout << "  p99:    " << percentile(99)  << " ns\n";
-    std::cout << "  p99.9:  " << percentile(99.9) << " ns\n";
-    std::cout << "Classification: resting limit inserts across " << kBand
-              << " price levels, " << allocator_label << ", std::map levels\n";
-    std::cout << "Boundary: order submitted -> trades vector returned (no I/O, no logging)\n";
+    std::cout << "\n=== Latency percentiles: " << label << " ===\n";
+    std::cout << "Allocator: " << allocator_label
+              << "   Events: " << N << "   Rejected: " << s.rejected << "\n";
+    std::cout << "  p50:    " << p50       << " ns\n";
+    std::cout << "  p95:    " << pct(95)   << " ns\n";
+    std::cout << "  p99:    " << pct(99)   << " ns\n";
+    std::cout << "  p99.9:  " << pct(99.9) << " ns\n";
 
-    // --- Tail analysis: what makes the p95->p99 jump bimodal? ---
-    // Every order rests, so each submit performs two heap allocations: a
-    // std::list node (the object pool serves this unless LOB_NO_POOL) and an
-    // index_ unordered_map node (always the system allocator, with a periodic
-    // rehash). We classify each slow sample as: it created a new price level
-    // (std::map node), it triggered an index rehash (bucket-array realloc), or
-    // neither — the residual being the per-insert node malloc slow-path + jitter.
-    const int64_t slow_threshold = std::max<int64_t>(200, 8 * p50);
-    size_t slow = 0, slow_level = 0, slow_rehash = 0, slow_other = 0;
-    for (size_t i = 0; i < latencies.size(); ++i) {
-        if (latencies[i] > slow_threshold) {
+    const int64_t thr = std::max<int64_t>(200, 8 * p50);
+    size_t slow = 0, sl = 0, sr = 0, so = 0;
+    for (size_t i = 0; i < s.latency.size(); ++i)
+        if (s.latency[i] > thr) {
             ++slow;
-            if      (cause[i] == 1) ++slow_level;
-            else if (cause[i] == 2) ++slow_rehash;
-            else                    ++slow_other;
+            if      (s.cause[i] == 1) ++sl;
+            else if (s.cause[i] == 2) ++sr;
+            else                      ++so;
+        }
+    std::cout << "  tail (> " << thr << " ns): " << slow << " total | new-level " << sl
+              << " [" << s.levels_created << "] | index-rehash " << sr
+              << " [" << s.index_rehashes << "] | node-malloc/jitter " << so << "\n";
+    std::cout << "  max trades per submit: " << s.max_trades
+              << (s.max_trades == 0 ? "  (pure resting path)\n" : "  (crossing path)\n");
+
+    if (write_csv) {
+        const char* csv_path = "data/latency_samples.csv";
+        std::ofstream csv(csv_path);
+        if (csv) {
+            csv << "latency_ns\n";
+            for (int64_t ns : sorted) csv << ns << '\n';
+            std::cout << "  wrote " << sorted.size() << " samples to " << csv_path << "\n";
+        } else {
+            std::cout << "  WARNING: could not open " << csv_path
+                      << " (run from the repo root so data/ exists)\n";
         }
     }
-    std::cout << "--- Tail analysis (bimodal p95->p99) ---\n";
-    std::cout << "slow threshold:             " << slow_threshold << " ns (8x p50)\n";
-    std::cout << "slow submits (> threshold): " << slow << " / " << N
-              << "  (" << (100.0 * static_cast<double>(slow) / N) << "%)\n";
-    std::cout << "  new price level (std::map node):        " << slow_level
-              << "   [levels created total: " << levels_created_total << "]\n";
-    std::cout << "  index_ rehash (unordered_map realloc):  " << slow_rehash
-              << "   [rehashes total: " << index_rehashes_total << "]\n";
-    std::cout << "  neither (node malloc slow-path/jitter): " << slow_other << "\n";
-    std::cout << "max trades per submit: " << max_trades
-              << "  (0 = pure resting path, no crossing)\n";
+}
 
-    // Dump raw per-op samples so the histogram is plotted from real data
-    // (see python/make_charts.py), not a modeled distribution.
-    const char* csv_path = "data/latency_samples.csv";
-    std::ofstream csv(csv_path);
-    if (csv) {
-        csv << "latency_ns\n";
-        for (int64_t ns : sorted) csv << ns << '\n';
-        std::cout << "Wrote " << sorted.size() << " samples to " << csv_path << "\n";
-    } else {
-        std::cout << "WARNING: could not open " << csv_path
-                  << " (run from the repo root so data/ exists)\n";
+// Pre-populate two-sided resting liquidity for the crossing workload. Uses the
+// feed-replay rest() path (no risk, no matching), so a deep book can be built
+// without tripping the size/notional risk limits; aggressive orders then cross it.
+static void preload_crossing(OrderBook& book, OrderId& id) {
+    for (int k = 0; k < 6000; ++k) {
+        book.rest({++id, Side::Sell, OrderType::Limit,
+                   static_cast<Price>(10'100 + (k % 100)), 100});   // asks the buys will hit
+        book.rest({++id, Side::Buy,  OrderType::Limit,
+                   static_cast<Price>(9'900  + (k % 100)), 100});   // bids the sells will hit
     }
+}
+
+// --- Manual percentile benchmark: two workloads over one shared timer ---
+void run_percentile_benchmark() {
+    const Timing tm = setup_timing();
+    const double cpu_mhz = read_cpu_mhz();
+    std::cout << "CPU frequency (observed): "
+              << (cpu_mhz > 0 ? std::to_string(cpu_mhz) + " MHz" : std::string("n/a")) << "\n";
+
+#ifdef LOB_NO_POOL
+    const char* allocator_label = "system (pool disabled)";
+#else
+    const char* allocator_label = "object pool (arena)";
+#endif
+    std::cout << "Allocator: " << allocator_label << "\n";
+
+    const int N = 1'000'000;
+
+    // Workload 1 — resting insert: no liquidity to cross, so every order rests and
+    // each submit allocates a std::list node (object pool unless LOB_NO_POOL) plus
+    // an index_ unordered_map node. Spread across a 100-level band. Feeds the histogram.
+    {
+        OrderBook book;
+        OrderId id = 0;
+        Samples s = measure(tm, book,
+            [&](int i) {
+                return Order{++id, Side::Buy, OrderType::Limit,
+                             static_cast<Price>(10'000 + (i % 100)), 10};
+            }, N);
+        report("resting insert", allocator_label, s, N, /*write_csv=*/true);
+    }
+
+    // Workload 2 — crossing/matching: pre-load a two-sided book, then submit
+    // aggressive orders that alternate buy/sell so they actually fill (max trades
+    // > 0) while net inventory stays within the risk limit. Exercises the match
+    // loop + trades-vector allocation + node free, not the resting-insert path.
+    {
+        OrderBook book;
+        OrderId id = 0;
+        preload_crossing(book, id);
+        Samples s = measure(tm, book,
+            [&](int i) {
+                return (i % 2 == 0)
+                    ? Order{++id, Side::Buy,  OrderType::Limit, 10'199, 1}  // crosses asks
+                    : Order{++id, Side::Sell, OrderType::Limit,  9'900, 1}; // crosses bids
+            }, N);
+        report("crossing/matching", allocator_label, s, N, /*write_csv=*/false);
+    }
+
+    std::cout << "Boundary: order submitted -> trades vector returned (no I/O, no logging)\n";
 }
 
 int main(int argc, char** argv) {
