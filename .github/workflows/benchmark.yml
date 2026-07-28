@@ -1,0 +1,40 @@
+name: Benchmark
+# Manually triggered — produces the canonical single-machine benchmark numbers
+# (Linux x86, Release, core-pinned) and uploads them for the README/BENCHMARKS.md.
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    name: latency + throughput (Linux x86)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake
+
+      - name: Configure (Release, no Python)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_PYTHON=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run benchmark (pinned to core 1)
+        run: taskset -c 1 ./build/bench 2>&1 | tee bench_output.txt
+
+      - name: Install Python plotting deps
+        run: sudo apt-get install -y python3-matplotlib python3-numpy python3-pandas
+
+      - name: Regenerate charts from the samples
+        run: python3 python/make_charts.py
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            images/latency_hist.png
+            bench_output.txt
+            data/latency_samples.csv
+            BENCHMARKS.md

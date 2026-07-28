@@ -14,7 +14,9 @@ import struct
 import numpy as np
 import matplotlib.pyplot as plt
 
-import lobpy as L
+# lobpy is imported lazily inside the charts that need it (depth_chart,
+# ofi_timeseries) so latency_hist() — which reads real bench data and needs no
+# bindings — can run even when the module was built with -DLOB_BUILD_PYTHON=OFF.
 
 # --- Validated palette (see the dataviz skill's reference instance) ---
 BID   = "#2a78d6"   # blue  — bid pressure
@@ -41,6 +43,7 @@ os.makedirs(IMG, exist_ok=True)
 # 1. Depth chart — cumulative bid/ask staircase
 # ----------------------------------------------------------------------------
 def depth_chart():
+    import lobpy as L
     book = L.OrderBook()
     bids = {9999: 120, 9998: 250, 9997: 400, 9996: 150, 9995: 300}
     asks = {10001: 100, 10002: 220, 10003: 180, 10004: 350, 10005: 200}
@@ -125,6 +128,7 @@ def _del_msg(ref):
     return struct.pack(">H", len(body)) + body
 
 def ofi_timeseries():
+    import lobpy as L
     book = L.OrderBook()
     h = L.ItchHandler(book)
     rng = np.random.default_rng(3)
@@ -176,7 +180,13 @@ def ofi_timeseries():
 
 
 if __name__ == "__main__":
-    depth_chart()
-    latency_hist()
-    ofi_timeseries()
+    latency_hist()   # real bench data; needs no bindings
+    try:
+        import lobpy  # noqa: F401
+    except ImportError:
+        print("lobpy not built — skipping depth_chart and ofi_timeseries "
+              "(build with -DLOB_BUILD_PYTHON=ON to regenerate them)")
+    else:
+        depth_chart()
+        ofi_timeseries()
     print("done")
